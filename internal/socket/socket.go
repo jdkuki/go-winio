@@ -60,6 +60,8 @@ func GetPeerName(s windows.Handle, rsa RawSockaddr) error {
 
 func Bind(s windows.Handle, rsa RawSockaddr) (err error) {
 	ptr, l, err := rsa.Sockaddr()
+	fmt.Println("Binding to socket with addr len", l)
+
 	if err != nil {
 		return fmt.Errorf("could not retrieve socket pointer and size: %w", err)
 	}

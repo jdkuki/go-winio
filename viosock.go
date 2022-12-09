@@ -5,11 +5,13 @@ package winio
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -19,11 +21,13 @@ import (
 	"github.com/Microsoft/go-winio/internal/socket"
 )
 
-var afVsock uint16
+var afViosock, viosockSupportedErr = getViosockAf()
+var viosockInit sync.Once
 
 const (
 	VIOSOCK_DEVICE_NAME = "\\??\\Viosock"
 	IOCTL_GET_AF        = 0x0801300C
+	IOCTL_FIONBIO       = 0x8004667e
 
 	VMADDR_CID_ANY        = 0xffffffff // -1
 	VMADDR_CID_HYPERVISOR = 0
@@ -49,52 +53,42 @@ func getViosockAf() (uint16, error) {
 	if err != nil {
 		return 0, err
 	}
+	windows.Close(handle)
 	return uint16(af), nil
 }
 
-type VioVsockAddr struct {
+type ViosockAddr struct {
 	Port uint32
 	Cid  uint32
 }
 
-type rawVioVsockAddr struct {
+type rawViosockAddr struct {
 	Family uint16
 	_      uint16
 	Port   uint32 // host byte order
 	Cid    uint32 // host byte order
 }
 
-var _ socket.RawSockaddr = &rawVioVsockAddr{}
+var _ socket.RawSockaddr = &rawViosockAddr{}
 
 // Network returns the address's network name, "hvsock".
-func (*VioVsockAddr) Network() string {
+func (*ViosockAddr) Network() string {
 	return "viovsock"
 }
 
-func (addr *VioVsockAddr) String() string {
-	return fmt.Sprintf("%s:%s", &addr.Cid, &addr.Port)
+func (addr *ViosockAddr) String() string {
+	return fmt.Sprintf("%s:%d", addr.Cid, addr.Port)
 }
 
-// VsockServiceID returns an hvsock service ID corresponding to the specified AF_VSOCK port.
-//func VsockServiceID(port uint32) guid.GUID {
-//	g := hvsockVsockServiceTemplate() // make a copy
-//	g.Data1 = port
-//	return g
-//}
-
-func (addr *VioVsockAddr) raw() rawVioVsockAddr {
-	af, err := getViosockAf()
-	if err != nil {
-		panic("unsupported address family")
-	}
-	return rawVioVsockAddr{
-		Family: af,
+func (addr *ViosockAddr) raw() rawViosockAddr {
+	return rawViosockAddr{
+		Family: afViosock,
 		Port:   addr.Port,
 		Cid:    addr.Cid,
 	}
 }
 
-func (addr *VioVsockAddr) fromRaw(raw *rawVioVsockAddr) {
+func (addr *ViosockAddr) fromRaw(raw *rawViosockAddr) {
 	addr.Cid = raw.Cid
 	addr.Port = raw.Port
 }
@@ -103,66 +97,74 @@ func (addr *VioVsockAddr) fromRaw(raw *rawVioVsockAddr) {
 //
 // Implements the [socket.RawSockaddr] interface, and allows use in
 // [socket.Bind] and [socket.ConnectEx].
-func (r *rawVioVsockAddr) Sockaddr() (unsafe.Pointer, int32, error) {
-	return unsafe.Pointer(r), int32(unsafe.Sizeof(rawVioVsockAddr{})), nil
+func (r *rawViosockAddr) Sockaddr() (unsafe.Pointer, int32, error) {
+	p := unsafe.Pointer(r)
+	s := unsafe.Slice((*byte)(p), unsafe.Sizeof(rawViosockAddr{}))
+	fmt.Println("Using addr: ", hex.EncodeToString((s)))
+	return unsafe.Pointer(r), int32(unsafe.Sizeof(rawViosockAddr{})), nil
 }
 
 // Sockaddr interface allows use with `sockets.Bind()` and `.ConnectEx()`.
-func (r *rawVioVsockAddr) FromBytes(b []byte) error {
-	n := int(unsafe.Sizeof(rawVioVsockAddr{}))
+func (r *rawViosockAddr) FromBytes(b []byte) error {
+	n := int(unsafe.Sizeof(rawViosockAddr{}))
 
 	if len(b) < n {
 		return fmt.Errorf("got %d, want %d: %w", len(b), n, socket.ErrBufferSize)
 	}
 
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(r)), n), b[:n])
-	if r.Family != uint16(afVsock) {
-		return fmt.Errorf("got %d, want %d: %w", r.Family, afVsock, socket.ErrAddrFamily)
+	if r.Family != uint16(afViosock) {
+		return fmt.Errorf("got %d, want %d: %w", r.Family, afViosock, socket.ErrAddrFamily)
 	}
 
 	return nil
 }
 
-// VioVsockListener is a socket listener for the AF_HYPERV address family.
-type VioVsockListener struct {
+// ViosockListener is a socket listener for the AF_HYPERV address family.
+type ViosockListener struct {
 	sock *win32File
-	addr VioVsockAddr
+	addr ViosockAddr
 }
 
-var _ net.Listener = &VioVsockListener{}
+var _ net.Listener = &ViosockListener{}
 
-// VioVsockConn is a connected socket of the AF_HYPERV address family.
-type VioVsockConn struct {
+// ViosockConn is a connected socket of the AF_HYPERV address family.
+type ViosockConn struct {
 	sock          *win32File
-	local, remote VioVsockAddr
+	local, remote ViosockAddr
 }
 
-var _ net.Conn = &VioVsockConn{}
+var _ net.Conn = &ViosockConn{}
 
-func newVioVSocket() (*win32File, error) {
-	af, err := getViosockAf()
-	if err != nil {
-		panic("unsupported af")
+func initViosock() {
+	if viosockSupportedErr != nil {
+		fmt.Println(viosockSupportedErr)
+		panic("Address family is not supported")
 	}
-	afVsock = af
-	fd, err := syscall.Socket(int(afVsock), syscall.SOCK_STREAM, 0)
+}
+
+func newVioSocket() (*win32File, error) {
+	viosockInit.Do(initViosock)
+	fd, err := syscall.Socket(int(afViosock), syscall.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, os.NewSyscallError("socket", err)
 	}
+
 	f, err := makeWin32File(fd)
 	if err != nil {
 		syscall.Close(fd)
 		return nil, err
 	}
+
 	f.socket = true
 	return f, nil
 }
 
-// ListenVioVsock listens for connections on the specified hvsock address.
-func ListenVioVsock(addr *VioVsockAddr) (_ *VioVsockListener, err error) {
-	l := &VioVsockListener{addr: *addr}
+// ListenViosock listens for connections on the specified hvsock address.
+func ListenViosock(addr *ViosockAddr) (_ *ViosockListener, err error) {
+	l := &ViosockListener{addr: *addr}
 	fmt.Println("Creating socket")
-	sock, err := newVioVSocket()
+	sock, err := newVioSocket()
 	fmt.Println("Socket Created")
 	if err != nil {
 		fmt.Println("failed to create")
@@ -170,6 +172,7 @@ func ListenVioVsock(addr *VioVsockAddr) (_ *VioVsockListener, err error) {
 	}
 	sa := addr.raw()
 	fmt.Println("Binding Socket")
+	fmt.Println("sock fd:", sock.handle)
 	err = socket.Bind(windows.Handle(sock.handle), &sa)
 	if err != nil {
 		fmt.Println("failed to bind")
@@ -183,21 +186,21 @@ func ListenVioVsock(addr *VioVsockAddr) (_ *VioVsockListener, err error) {
 		return nil, l.opErr("listen", os.NewSyscallError("listen", err))
 	}
 	fmt.Println("Socket listened")
-	return &VioVsockListener{sock: sock, addr: *addr}, nil
+	return &ViosockListener{sock: sock, addr: *addr}, nil
 }
 
-func (l *VioVsockListener) opErr(op string, err error) error {
+func (l *ViosockListener) opErr(op string, err error) error {
 	return &net.OpError{Op: op, Net: "viosock", Addr: &l.addr, Err: err}
 }
 
 // Addr returns the listener's network address.
-func (l *VioVsockListener) Addr() net.Addr {
+func (l *ViosockListener) Addr() net.Addr {
 	return &l.addr
 }
 
 // Accept waits for the next connection and returns it.
-func (l *VioVsockListener) Accept() (_ net.Conn, err error) {
-	sock, err := newVioVSocket()
+func (l *ViosockListener) Accept() (_ net.Conn, err error) {
+	sock, err := newVioSocket()
 	if err != nil {
 		return nil, l.opErr("accept", err)
 	}
@@ -215,7 +218,7 @@ func (l *VioVsockListener) Accept() (_ net.Conn, err error) {
 	// AcceptEx, per documentation, requires an extra 16 bytes per address.
 	//
 	// https://docs.microsoft.com/en-us/windows/win32/api/mswsock/nf-mswsock-acceptex
-	const addrlen = uint32(16 + unsafe.Sizeof(rawVioVsockAddr{}))
+	const addrlen = uint32(16 + unsafe.Sizeof(rawViosockAddr{}))
 	var addrbuf [addrlen * 2]byte
 
 	var bytes uint32
@@ -224,7 +227,7 @@ func (l *VioVsockListener) Accept() (_ net.Conn, err error) {
 		return nil, l.opErr("accept", os.NewSyscallError("acceptex", err))
 	}
 
-	conn := &VioVsockConn{
+	conn := &ViosockConn{
 		sock: sock,
 	}
 	// The local address returned in the AcceptEx buffer is the same as the Listener socket's
@@ -232,8 +235,8 @@ func (l *VioVsockListener) Accept() (_ net.Conn, err error) {
 	// socket, and is sometimes the same as the local address of the socket that dialed the
 	// address, with the service GUID.Data1 incremented, but othertimes is different.
 	// todo: does the local address matter? is the listener's address or the actual address appropriate?
-	conn.local.fromRaw((*rawVioVsockAddr)(unsafe.Pointer(&addrbuf[0])))
-	conn.remote.fromRaw((*rawVioVsockAddr)(unsafe.Pointer(&addrbuf[addrlen])))
+	conn.local.fromRaw((*rawViosockAddr)(unsafe.Pointer(&addrbuf[0])))
+	conn.remote.fromRaw((*rawViosockAddr)(unsafe.Pointer(&addrbuf[addrlen])))
 
 	// initialize the accepted socket and update its properties with those of the listening socket
 	if err = windows.Setsockopt(windows.Handle(sock.handle),
@@ -247,12 +250,12 @@ func (l *VioVsockListener) Accept() (_ net.Conn, err error) {
 }
 
 // Close closes the listener, causing any pending Accept calls to fail.
-func (l *VioVsockListener) Close() error {
+func (l *ViosockListener) Close() error {
 	return l.sock.Close()
 }
 
-// VioVsockDialer configures and dials a Hyper-V Socket (ie, [VioVsockConn]).
-type VioVsockDialer struct {
+// ViosockDialer configures and dials a Hyper-V Socket (ie, [ViosockConn]).
+type ViosockDialer struct {
 	// Deadline is the time the Dial operation must connect before erroring.
 	Deadline time.Time
 
@@ -268,20 +271,20 @@ type VioVsockDialer struct {
 
 // Dial the Hyper-V socket at addr.
 //
-// See [VioVsockDialer.Dial] for more information.
-func Dial(ctx context.Context, addr *VioVsockAddr) (conn *VioVsockConn, err error) {
-	return (&VioVsockDialer{}).Dial(ctx, addr)
+// See [ViosockDialer.Dial] for more information.
+func Dial(ctx context.Context, addr *ViosockAddr) (conn *ViosockConn, err error) {
+	return (&ViosockDialer{}).Dial(ctx, addr)
 }
 
 // Dial attempts to connect to the Hyper-V socket at addr, and returns a connection if successful.
-// Will attempt (VioVsockDialer).Retries if dialing fails, waiting (VioVsockDialer).RetryWait between
+// Will attempt (ViosockDialer).Retries if dialing fails, waiting (ViosockDialer).RetryWait between
 // retries.
 //
-// Dialing can be cancelled either by providing (VioVsockDialer).Deadline, or cancelling ctx.
-func (d *VioVsockDialer) Dial(ctx context.Context, addr *VioVsockAddr) (conn *VioVsockConn, err error) {
+// Dialing can be cancelled either by providing (ViosockDialer).Deadline, or cancelling ctx.
+func (d *ViosockDialer) Dial(ctx context.Context, addr *ViosockAddr) (conn *ViosockConn, err error) {
 	op := "dial"
 	// create the conn early to use opErr()
-	conn = &VioVsockConn{
+	conn = &ViosockConn{
 		remote: *addr,
 	}
 
@@ -296,7 +299,7 @@ func (d *VioVsockDialer) Dial(ctx context.Context, addr *VioVsockAddr) (conn *Vi
 		return nil, conn.opErr(op, err)
 	}
 
-	sock, err := newVioVSocket()
+	sock, err := newVioSocket()
 	if err != nil {
 		return nil, conn.opErr(op, err)
 	}
@@ -350,7 +353,7 @@ func (d *VioVsockDialer) Dial(ctx context.Context, addr *VioVsockAddr) (conn *Vi
 	}
 
 	// get the local name
-	var sal rawVioVsockAddr
+	var sal rawViosockAddr
 	err = socket.GetSockName(windows.Handle(sock.handle), &sal)
 	if err != nil {
 		return nil, conn.opErr(op, os.NewSyscallError("getsockname", err))
@@ -369,7 +372,7 @@ func (d *VioVsockDialer) Dial(ctx context.Context, addr *VioVsockAddr) (conn *Vi
 }
 
 // redialWait waits before attempting to redial, resetting the timer as appropriate.
-func (d *VioVsockDialer) redialWait(ctx context.Context) (err error) {
+func (d *ViosockDialer) redialWait(ctx context.Context) (err error) {
 	if d.RetryWait == 0 {
 		return nil
 	}
@@ -406,7 +409,7 @@ func canRedial(err error) bool {
 	}
 }
 
-func (conn *VioVsockConn) opErr(op string, err error) error {
+func (conn *ViosockConn) opErr(op string, err error) error {
 	// translate from "file closed" to "socket closed"
 	if errors.Is(err, ErrFileClosed) {
 		err = socket.ErrSocketClosed
@@ -414,7 +417,7 @@ func (conn *VioVsockConn) opErr(op string, err error) error {
 	return &net.OpError{Op: op, Net: "viosock", Source: &conn.local, Addr: &conn.remote, Err: err}
 }
 
-func (conn *VioVsockConn) Read(b []byte) (int, error) {
+func (conn *ViosockConn) Read(b []byte) (int, error) {
 	c, err := conn.sock.prepareIO()
 	if err != nil {
 		return 0, conn.opErr("read", err)
@@ -436,7 +439,7 @@ func (conn *VioVsockConn) Read(b []byte) (int, error) {
 	return n, err
 }
 
-func (conn *VioVsockConn) Write(b []byte) (int, error) {
+func (conn *ViosockConn) Write(b []byte) (int, error) {
 	t := 0
 	for len(b) != 0 {
 		n, err := conn.write(b)
@@ -449,7 +452,7 @@ func (conn *VioVsockConn) Write(b []byte) (int, error) {
 	return t, nil
 }
 
-func (conn *VioVsockConn) write(b []byte) (int, error) {
+func (conn *ViosockConn) write(b []byte) (int, error) {
 	c, err := conn.sock.prepareIO()
 	if err != nil {
 		return 0, conn.opErr("write", err)
@@ -470,16 +473,16 @@ func (conn *VioVsockConn) write(b []byte) (int, error) {
 }
 
 // Close closes the socket connection, failing any pending read or write calls.
-func (conn *VioVsockConn) Close() error {
+func (conn *ViosockConn) Close() error {
 	return conn.sock.Close()
 }
 
-func (conn *VioVsockConn) IsClosed() bool {
+func (conn *ViosockConn) IsClosed() bool {
 	return conn.sock.IsClosed()
 }
 
 // shutdown disables sending or receiving on a socket.
-func (conn *VioVsockConn) shutdown(how int) error {
+func (conn *ViosockConn) shutdown(how int) error {
 	if conn.IsClosed() {
 		return socket.ErrSocketClosed
 	}
@@ -497,7 +500,7 @@ func (conn *VioVsockConn) shutdown(how int) error {
 }
 
 // CloseRead shuts down the read end of the socket, preventing future read operations.
-func (conn *VioVsockConn) CloseRead() error {
+func (conn *ViosockConn) CloseRead() error {
 	err := conn.shutdown(syscall.SHUT_RD)
 	if err != nil {
 		return conn.opErr("closeread", err)
@@ -507,7 +510,7 @@ func (conn *VioVsockConn) CloseRead() error {
 
 // CloseWrite shuts down the write end of the socket, preventing future write operations and
 // notifying the other endpoint that no more data will be written.
-func (conn *VioVsockConn) CloseWrite() error {
+func (conn *ViosockConn) CloseWrite() error {
 	err := conn.shutdown(syscall.SHUT_WR)
 	if err != nil {
 		return conn.opErr("closewrite", err)
@@ -516,17 +519,17 @@ func (conn *VioVsockConn) CloseWrite() error {
 }
 
 // LocalAddr returns the local address of the connection.
-func (conn *VioVsockConn) LocalAddr() net.Addr {
+func (conn *ViosockConn) LocalAddr() net.Addr {
 	return &conn.local
 }
 
 // RemoteAddr returns the remote address of the connection.
-func (conn *VioVsockConn) RemoteAddr() net.Addr {
+func (conn *ViosockConn) RemoteAddr() net.Addr {
 	return &conn.remote
 }
 
 // SetDeadline implements the net.Conn SetDeadline method.
-func (conn *VioVsockConn) SetDeadline(t time.Time) error {
+func (conn *ViosockConn) SetDeadline(t time.Time) error {
 	// todo: implement `SetDeadline` for `win32File`
 	if err := conn.SetReadDeadline(t); err != nil {
 		return fmt.Errorf("set read deadline: %w", err)
@@ -538,11 +541,11 @@ func (conn *VioVsockConn) SetDeadline(t time.Time) error {
 }
 
 // SetReadDeadline implements the net.Conn SetReadDeadline method.
-func (conn *VioVsockConn) SetReadDeadline(t time.Time) error {
+func (conn *ViosockConn) SetReadDeadline(t time.Time) error {
 	return conn.sock.SetReadDeadline(t)
 }
 
 // SetWriteDeadline implements the net.Conn SetWriteDeadline method.
-func (conn *VioVsockConn) SetWriteDeadline(t time.Time) error {
+func (conn *ViosockConn) SetWriteDeadline(t time.Time) error {
 	return conn.sock.SetWriteDeadline(t)
 }
